@@ -1,6 +1,7 @@
 #include "graphics_internal.hpp"
 
 #include <iostream>
+#include <fstream>
 #include <vector>
 
 #include <vulkan/vulkan.h>
@@ -26,6 +27,8 @@ namespace graphics::internal {
 namespace {
 
 VkInstance vk_instance;
+VkDebugUtilsMessengerEXT vk_debug_messenger;
+std::ofstream validation_log;
 uint32_t vk_api_version;
 VkSurfaceKHR vk_surface;
 
@@ -57,6 +60,16 @@ VkRenderPass vk_imgui_render_pass;
 std::vector<VkFramebuffer> vk_imgui_framebuffers;
 VkCommandPool vk_imgui_command_pool;
 VkCommandBuffer vk_imgui_command_buffer;
+
+VKAPI_ATTR VkBool32 VKAPI_CALL validationCallback(
+	VkDebugUtilsMessageSeverityFlagBitsEXT,
+	VkDebugUtilsMessageTypeFlagsEXT,
+	const VkDebugUtilsMessengerCallbackDataEXT* data,
+	void*) {
+	std::cerr << data->pMessage << '\n';
+	if (validation_log) validation_log << data->pMessage << std::endl;
+	return VK_FALSE;
+}
 
 VkFormat selectDepthFormat(VkPhysicalDevice physical_device) {
 	// Prefer the original format and preserve stencil support in the fallback.
@@ -257,6 +270,7 @@ bool rebuildSwapchain(uint32_t width, uint32_t height) {
 					   .build();
 	if (!sb_result) {
 		std::cerr << sb_result.error().message() << '\n';
+		return false;
 	}
 
 	auto vkb_swapchain = sb_result.value();
@@ -272,6 +286,8 @@ bool rebuildSwapchain(uint32_t width, uint32_t height) {
 	vk_swapchain = vkb_swapchain.swapchain;
 	context.swapchain_format = vkb_swapchain.image_format;
 	context.swapchain_extent = vkb_swapchain.extent;
+	vk_swapchain_resize_width = context.swapchain_extent.width;
+	vk_swapchain_resize_height = context.swapchain_extent.height;
 
 	auto swapchain_images = vkb_swapchain.get_images().value();
 	auto swapchain_image_views = vkb_swapchain.get_image_views().value();
@@ -377,6 +393,20 @@ bool rebuildSwapchain(uint32_t width, uint32_t height) {
 		}
 	}
 
+	if (vk_semaphores_image_finished.size() != swapchain_images_count) {
+		for (VkSemaphore semaphore : vk_semaphores_image_finished) {
+			vkDestroySemaphore(context.device, semaphore, nullptr);
+		}
+		vk_semaphores_image_finished.assign(swapchain_images_count, VK_NULL_HANDLE);
+		const VkSemaphoreCreateInfo semaphore_info{.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+		for (VkSemaphore& semaphore : vk_semaphores_image_finished) {
+			if (vkCreateSemaphore(context.device, &semaphore_info, nullptr, &semaphore) != VK_SUCCESS) {
+				return false;
+			}
+		}
+		ImGui_ImplVulkan_SetMinImageCount(swapchain_images_count);
+	}
+
 	vk_swapchain_resize_require = false;
 
 	return true;
@@ -387,14 +417,21 @@ bool rebuildSwapchain(uint32_t width, uint32_t height) {
 Context context;
 
 bool initialize(GLFWwindow* const window) {
+	validation_log.open(LAB_VALIDATION_LOG, std::ios::trunc);
 	vkb::InstanceBuilder ib;
 
 	auto ibr = ib.require_api_version(VK_MAKE_VERSION(1, 1, 0))
 				 .request_validation_layers()
+				 .set_debug_callback(validationCallback)
 				 .build();
 
+	if (!ibr) {
+		std::cerr << ibr.error().message() << '\n';
+		return false;
+	}
 	auto vkb_instance = ibr.value();
 	vk_instance = vkb_instance.instance;
+	vk_debug_messenger = vkb_instance.debug_messenger;
 	vk_api_version = vkb_instance.api_version;
 
 	if (glfwCreateWindowSurface(vk_instance, window, nullptr, &vk_surface) != VK_SUCCESS) {
@@ -477,6 +514,8 @@ bool initialize(GLFWwindow* const window) {
 	vk_swapchain = vkb_swapchain.swapchain;
 	context.swapchain_format = vkb_swapchain.image_format;
 	context.swapchain_extent = vkb_swapchain.extent;
+	vk_swapchain_resize_width = context.swapchain_extent.width;
+	vk_swapchain_resize_height = context.swapchain_extent.height;
 	vk_swapchain_images = vkb_swapchain.get_images().value();
 	vk_swapchain_image_views = vkb_swapchain.get_image_views().value();
 	vk_swapchain_current_image = UINT32_MAX;
@@ -705,7 +744,9 @@ void shutdown() {
 	vkDestroyDevice(context.device, nullptr);
 
 	vkDestroySurfaceKHR(vk_instance, vk_surface, nullptr);
+	vkb::destroy_debug_utils_messenger(vk_instance, vk_debug_messenger);
 	vkDestroyInstance(vk_instance, nullptr);
+	validation_log.close();
 }
 
 void resize(uint32_t width, uint32_t height) {
@@ -730,7 +771,9 @@ retry_acquire:
 		break;
 
 	case VK_ERROR_OUT_OF_DATE_KHR:
-		rebuildSwapchain(vk_swapchain_resize_width, vk_swapchain_resize_height);
+		if (!rebuildSwapchain(vk_swapchain_resize_width, vk_swapchain_resize_height)) {
+			return {};
+		}
 		goto retry_acquire;
 
 	case VK_SUBOPTIMAL_KHR:
@@ -750,7 +793,7 @@ retry_acquire:
 	};
 }
 
-void submitAndPresent() {
+bool submitAndPresent() {
 	drawImGUI();
 
 	const VkPipelineStageFlags stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
@@ -770,7 +813,10 @@ void submitAndPresent() {
 		.pSignalSemaphores = &vk_semaphores_image_finished[vk_swapchain_current_image],
 	};
 
-	vkQueueSubmit(context.graphics_queue, 1, &submit, vk_fence_frame_in_flight);
+	if (vkQueueSubmit(context.graphics_queue, 1, &submit, vk_fence_frame_in_flight) != VK_SUCCESS) {
+		std::cerr << "Failed to submit Vulkan frame\n";
+		return false;
+	}
 
 	const VkPresentInfoKHR present = {
 		.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
@@ -785,10 +831,15 @@ void submitAndPresent() {
 	if (result == VK_ERROR_OUT_OF_DATE_KHR ||
 	    result == VK_SUBOPTIMAL_KHR ||
 	    vk_swapchain_resize_require) {
-		rebuildSwapchain(vk_swapchain_resize_width, vk_swapchain_resize_height);
-	} else {
+		if (!rebuildSwapchain(vk_swapchain_resize_width, vk_swapchain_resize_height)) {
+			std::cerr << "Failed to rebuild Vulkan swapchain\n";
+			return false;
+		}
+	} else if (result != VK_SUCCESS) {
 		std::cerr << "Failed to present Vulkan swapchain image\n";
+		return false;
 	}
+	return true;
 }
 
 } // namespace graphics::internal

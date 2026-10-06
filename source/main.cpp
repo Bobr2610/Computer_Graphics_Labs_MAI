@@ -17,7 +17,7 @@ namespace {
 constexpr int32_t default_window_width = 1280;
 constexpr int32_t default_window_height = 720;
 
-constexpr char default_window_title[] = "Vulkan Starter App";
+constexpr char default_window_title[] = "Lab 1 - Octahedron";
 
 GLFWwindow* glfw_window;
 
@@ -39,6 +39,8 @@ int main() {
 		status = EXIT_FAILURE;
 		goto err_null_window;
 	}
+
+	glfwSetWindowSizeLimits(glfw_window, 800, 600, GLFW_DONT_CARE, GLFW_DONT_CARE);
 
 	glfwSetFramebufferSizeCallback(glfw_window, [](GLFWwindow*, int width, int height){
 		if (width == 0 || height == 0) {
@@ -76,6 +78,13 @@ int main() {
 		const double time = glfwGetTime();
 
 		glfwPollEvents();
+		int width = 0;
+		int height = 0;
+		glfwGetFramebufferSize(glfw_window, &width, &height);
+		if (width == 0 || height == 0) {
+			glfwWaitEvents();
+			continue;
+		}
 		ImGui_ImplGlfw_NewFrame();
 
 		ImGui::NewFrame();
@@ -83,8 +92,10 @@ int main() {
 		ImGui::Render();
 
 		graphics::internal::FrameData fd = graphics::internal::prepare();
-		application::render(fd);
-		graphics::internal::submitAndPresent();
+		if (!application::render(fd) || !graphics::internal::submitAndPresent()) {
+			status = EXIT_FAILURE;
+			break;
+		}
 	}
 
 	application::shutdown();
@@ -99,5 +110,5 @@ err_imgui_init:
 err_null_window:
 	glfwTerminate();
 
-	return 0;
+	return status;
 }
