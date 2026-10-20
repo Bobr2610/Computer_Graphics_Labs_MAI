@@ -26,6 +26,13 @@ math::Vec3 transform(const math::Mat4& matrix, math::Vec3 point) {
 	};
 }
 
+math::Vec3 projectToNdc(const math::Mat4& view, const math::Mat4& projection, const math::Vec3& point) {
+	const math::Vec3 eye = transform(view, point);
+	const math::Vec3 clip = transform(projection, eye);
+	const float w = projection.at(3, 2) * eye.z + projection.at(3, 3);
+	return {clip.x / w, clip.y / w, clip.z / w};
+}
+
 void checkOctahedron() {
 	const auto vertices = geometry::makeOctahedronVertices();
 	const auto& indices = geometry::octahedronIndices;
@@ -71,12 +78,33 @@ void checkTransforms() {
 	}
 }
 
+// Both projections flip the y axis for the y-down screen space, so the faces
+// turned to the camera have a negative signed area in framebuffer coordinates,
+// which is the orientation VK_FRONT_FACE_CLOCKWISE selects for back-face culling.
+void checkWinding() {
+	const auto vertices = geometry::makeOctahedronVertices();
+	const auto& indices = geometry::octahedronIndices;
+	const math::Mat4 view = math::viewMatrix();
+	for (const auto& projection : {math::perspectiveMatrix(16.0f / 9.0f), math::orthographicMatrix(16.0f / 9.0f)}) {
+		const auto ndc = [&](int corner) {
+			const auto& position = vertices[indices[corner]].position;
+			return projectToNdc(view, projection, math::Vec3{position[0], position[1], position[2]});
+		};
+		const math::Vec3 a = ndc(0);
+		const math::Vec3 b = ndc(1);
+		const math::Vec3 c = ndc(2);
+		const float area = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+		require(area < 0.0f, "The visible faces must be clockwise in framebuffer coordinates");
+	}
+}
+
 } // namespace
 
 int main() {
 	try {
 		checkOctahedron();
 		checkTransforms();
+		checkWinding();
 		std::cout << "Geometry and projection checks passed\n";
 		return 0;
 	} catch (const std::exception& error) {

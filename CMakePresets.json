@@ -10,7 +10,7 @@
 		{
 			"name": "debug",
 			"inherits": "common",
-			"binaryDir": "build-debug",
+			"binaryDir": "build-ninja-debug",
 			"cacheVariables": {
 				"CMAKE_BUILD_TYPE": "Debug"
 			}
@@ -18,7 +18,7 @@
 		{
 			"name": "release",
 			"inherits": "common",
-			"binaryDir": "build-release",
+			"binaryDir": "build-ninja-release",
 			"cacheVariables": {
 				"CMAKE_BUILD_TYPE": "Release"
 			}
@@ -26,22 +26,26 @@
 		{
 			"name": "msvc-debug",
 			"inherits": "debug",
-			"generator": "Visual Studio 17 2022"
+			"generator": "Visual Studio 17 2022",
+			"binaryDir": "build-debug"
 		},
 		{
 			"name": "msvc-release",
 			"inherits": "release",
-			"generator": "Visual Studio 17 2022"
+			"generator": "Visual Studio 17 2022",
+			"binaryDir": "build-msvc-release"
 		},
 		{
 			"name": "mingw-debug",
 			"inherits": "debug",
-			"generator": "MinGW Makefiles"
+			"generator": "MinGW Makefiles",
+			"binaryDir": "build-mingw-debug"
 		},
 		{
 			"name": "mingw-release",
 			"inherits": "release",
-			"generator": "MinGW Makefiles"
+			"generator": "MinGW Makefiles",
+			"binaryDir": "build-mingw-release"
 		}
 	]
 }

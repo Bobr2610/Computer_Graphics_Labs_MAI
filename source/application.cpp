@@ -32,6 +32,13 @@ constexpr uint32_t index_count = static_cast<uint32_t>(geometry::octahedronIndic
 constexpr float panelWidth = 340.0f;
 constexpr float viewportOffset = panelWidth + 32.0f;
 constexpr uint32_t object_count = 2;
+constexpr uint32_t main_object_index = 0;
+constexpr uint32_t companion_object_index = 1;
+
+uint32_t sceneViewportX(uint32_t framebufferWidth) {
+	if (framebufferWidth <= 1) return 0;
+	return std::min(static_cast<uint32_t>(viewportOffset), framebufferWidth - 1);
+}
 
 enum class ProjectionMode : int {
 	perspective = 0,
@@ -60,7 +67,7 @@ static_assert(offsetof(ObjectUniform, tint) == 64);
 struct Controls {
 	ProjectionMode projection = ProjectionMode::perspective;
 	std::array<float, 3> position{0.0f, 0.0f, 0.0f};
-	std::array<float, 3> rotationDegrees{0.0f, 0.0f, 0.0f};
+	std::array<float, 3> rotationDegrees{25.0f, -35.0f, 0.0f};
 	std::array<float, 3> scale{0.85f, 0.85f, 0.85f};
 	std::array<float, 3> tint{1.0f, 1.0f, 1.0f};
 	float pathRadius = 0.72f;
@@ -136,9 +143,11 @@ bool createDescriptorLayouts() {
 		return false;
 	}
 
-	const std::array<VkDescriptorSetLayout, 1 + object_count> layouts{{
-		sceneSetLayout, objectSetLayout, objectSetLayout,
-	}};
+	std::array<VkDescriptorSetLayout, 1 + object_count> layouts{};
+	layouts[0] = sceneSetLayout;
+	for (uint32_t i = 0; i < object_count; ++i) {
+		layouts[1 + i] = objectSetLayout;
+	}
 	std::array<VkDescriptorSet, 1 + object_count> descriptorSets{};
 	VkDescriptorSetAllocateInfo allocateInfo{};
 	allocateInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
@@ -150,14 +159,16 @@ bool createDescriptorLayouts() {
 		return false;
 	}
 	sceneDescriptorSet = descriptorSets[0];
-	objects[0].descriptorSet = descriptorSets[1];
-	objects[1].descriptorSet = descriptorSets[2];
 
-	const std::array<VkDescriptorBufferInfo, 1 + object_count> bufferInfos{{
-		{sceneUniformBuffer.buffer, 0, sizeof(SceneUniform)},
-		{objects[0].uniformBuffer.buffer, 0, sizeof(ObjectUniform)},
-		{objects[1].uniformBuffer.buffer, 0, sizeof(ObjectUniform)},
-	}};
+	for (uint32_t i = 0; i < object_count; ++i) {
+		objects[i].descriptorSet = descriptorSets[1 + i];
+	}
+
+	std::array<VkDescriptorBufferInfo, 1 + object_count> bufferInfos{};
+	bufferInfos[0] = {sceneUniformBuffer.buffer, 0, sizeof(SceneUniform)};
+	for (uint32_t i = 0; i < object_count; ++i) {
+		bufferInfos[1 + i] = {objects[i].uniformBuffer.buffer, 0, sizeof(ObjectUniform)};
+	}
 	std::array<VkWriteDescriptorSet, 1 + object_count> writes{};
 	for (uint32_t i = 0; i < writes.size(); ++i) {
 		writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -227,8 +238,8 @@ bool createGraphicsPipeline() {
 	VkPipelineRasterizationStateCreateInfo rasterization{};
 	rasterization.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
 	rasterization.polygonMode = VK_POLYGON_MODE_FILL;
-	rasterization.cullMode = VK_CULL_MODE_NONE;
-	rasterization.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+	rasterization.cullMode = VK_CULL_MODE_BACK_BIT;
+	rasterization.frontFace = VK_FRONT_FACE_CLOCKWISE;
 	rasterization.lineWidth = 1.0f;
 
 	VkPipelineMultisampleStateCreateInfo multisampling{};
@@ -373,7 +384,8 @@ void drawControls() {
 
 bool updateUniforms() {
 	auto& context = graphics::internal::context;
-	const float aspect = std::max(1.0f, static_cast<float>(context.swapchain_extent.width) - viewportOffset) /
+	const uint32_t viewportX = sceneViewportX(context.swapchain_extent.width);
+	const float aspect = static_cast<float>(context.swapchain_extent.width - viewportX) /
 					 static_cast<float>(context.swapchain_extent.height);
 	SceneUniform scene{};
 	scene.view = math::viewMatrix();
@@ -382,11 +394,15 @@ bool updateUniforms() {
 			: math::orthographicMatrix(aspect);
 	if (!uploadBuffer(sceneUniformBuffer, &scene, sizeof(scene))) return false;
 
-	const float t = static_cast<float>(animationTime);
+	const double fullTurn = 2.0 * static_cast<double>(math::pi);
+	const float t = static_cast<float>(std::remainder(animationTime, fullTurn));
+	const float mainSpin = static_cast<float>(std::remainder(0.65 * animationTime, fullTurn));
+	const float companionSpin = static_cast<float>(std::remainder(-0.45 * animationTime, fullTurn));
+	const float animation = controls.animationPlaying ? 1.0f : 0.0f;
 	const Vec3 animationOffset{
-		controls.pathRadius * std::cos(t),
-		controls.pathHeight * std::sin(2.0f * t),
-		controls.pathRadius * 0.7f * std::sin(t),
+		animation * controls.pathRadius * std::cos(t),
+		animation * controls.pathHeight * std::sin(2.0f * t),
+		animation * controls.pathRadius * 0.7f * std::sin(t),
 	};
 	const Vec3 mainPosition{
 		controls.position[0] + animationOffset.x,
@@ -395,9 +411,9 @@ bool updateUniforms() {
 	};
 	const Vec3 baseRotation = math::radiansFromDegrees(controls.rotationDegrees);
 	const Vec3 mainRotation{
-		baseRotation.x + 0.35f * std::sin(t),
-		baseRotation.y + 0.65f * t,
-		baseRotation.z + 0.25f * std::sin(2.0f * t),
+		baseRotation.x + animation * 0.35f * std::sin(t),
+		baseRotation.y + animation * mainSpin,
+		baseRotation.z + animation * 0.25f * std::sin(2.0f * t),
 	};
 	const Vec3 mainScale{controls.scale[0], controls.scale[1], controls.scale[2]};
 
@@ -407,10 +423,12 @@ bool updateUniforms() {
 	mainUniform.tint[1] = controls.tint[1];
 	mainUniform.tint[2] = controls.tint[2];
 	mainUniform.tint[3] = 1.0f;
-	if (!uploadBuffer(objects[0].uniformBuffer, &mainUniform, sizeof(mainUniform))) return false;
+	if (!uploadBuffer(objects[main_object_index].uniformBuffer, &mainUniform, sizeof(mainUniform))) return false;
+
+	if (!controls.showCompanion) return true;
 
 	const Vec3 companionPosition{-1.65f, 0.0f, -0.15f};
-	const Vec3 companionRotation{0.0f, -0.45f * t, 0.35f};
+	const Vec3 companionRotation{-0.35f, -0.6f + animation * companionSpin, 0.35f};
 	const Vec3 companionScale{0.52f, 0.52f, 0.52f};
 	ObjectUniform companionUniform{};
 	companionUniform.model = math::modelMatrix(companionPosition, companionRotation, companionScale);
@@ -418,7 +436,7 @@ bool updateUniforms() {
 	companionUniform.tint[1] = 0.8f;
 	companionUniform.tint[2] = 1.0f;
 	companionUniform.tint[3] = 1.0f;
-	return uploadBuffer(objects[1].uniformBuffer, &companionUniform, sizeof(companionUniform));
+	return uploadBuffer(objects[companion_object_index].uniformBuffer, &companionUniform, sizeof(companionUniform));
 }
 
 } // namespace
@@ -458,7 +476,7 @@ void update(double time) {
 bool render(const graphics::internal::FrameData& fd) {
 	auto& context = graphics::internal::context;
 	if (graphicsPipeline == VK_NULL_HANDLE || fd.command_buffer == VK_NULL_HANDLE ||
-		context.swapchain_extent.width <= static_cast<uint32_t>(viewportOffset) || context.swapchain_extent.height == 0) {
+		context.swapchain_extent.width == 0 || context.swapchain_extent.height == 0) {
 		return false;
 	}
 
@@ -493,17 +511,18 @@ bool render(const graphics::internal::FrameData& fd) {
 	vkCmdBeginRenderPass(fd.command_buffer, &renderBegin, VK_SUBPASS_CONTENTS_INLINE);
 
 	vkCmdBindPipeline(fd.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, graphicsPipeline);
+	const uint32_t viewportX = sceneViewportX(context.swapchain_extent.width);
 	const VkViewport viewport{
-		.x = viewportOffset,
+		.x = static_cast<float>(viewportX),
 		.y = 0.0f,
-		.width = std::max(1.0f, static_cast<float>(context.swapchain_extent.width) - viewportOffset),
+		.width = static_cast<float>(context.swapchain_extent.width - viewportX),
 		.height = static_cast<float>(context.swapchain_extent.height),
 		.minDepth = 0.0f,
 		.maxDepth = 1.0f,
 	};
 	const VkRect2D scissor{
-		{static_cast<int32_t>(viewportOffset), 0},
-		{context.swapchain_extent.width - static_cast<uint32_t>(viewportOffset), context.swapchain_extent.height},
+		{static_cast<int32_t>(viewportX), 0},
+		{context.swapchain_extent.width - viewportX, context.swapchain_extent.height},
 	};
 	vkCmdSetViewport(fd.command_buffer, 0, 1, &viewport);
 	vkCmdSetScissor(fd.command_buffer, 0, 1, &scissor);
@@ -511,13 +530,13 @@ bool render(const graphics::internal::FrameData& fd) {
 	vkCmdBindVertexBuffers(fd.command_buffer, 0, 1, &vertexBuffer.buffer, &vertexOffset);
 	vkCmdBindIndexBuffer(fd.command_buffer, indexBuffer.buffer, 0, VK_INDEX_TYPE_UINT16);
 
-	const std::array<VkDescriptorSet, 2> mainSets{{sceneDescriptorSet, objects[0].descriptorSet}};
+	const std::array<VkDescriptorSet, 2> mainSets{{sceneDescriptorSet, objects[main_object_index].descriptorSet}};
 	vkCmdBindDescriptorSets(fd.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout,
 						0, static_cast<uint32_t>(mainSets.size()), mainSets.data(), 0, nullptr);
 	vkCmdDrawIndexed(fd.command_buffer, index_count, 1, 0, 0, 0);
 
 	if (controls.showCompanion) {
-		const std::array<VkDescriptorSet, 2> companionSets{{sceneDescriptorSet, objects[1].descriptorSet}};
+		const std::array<VkDescriptorSet, 2> companionSets{{sceneDescriptorSet, objects[companion_object_index].descriptorSet}};
 		vkCmdBindDescriptorSets(fd.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout,
 							0, static_cast<uint32_t>(companionSets.size()), companionSets.data(), 0, nullptr);
 		vkCmdDrawIndexed(fd.command_buffer, index_count, 1, 0, 0, 0);
