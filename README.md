@@ -1,9 +1,6 @@
-# Vulkan Octahedron — Computer Graphics Lab 1
+# Vulkan Camera and Lighting Lab
 
-The application implements variant 2: a correctly indexed octahedron rendered
-with Vulkan. It demonstrates perspective and orthographic projection, model
-transforms, animation, per-vertex color, color tinting, and multiple objects
-with separate descriptor sets.
+Variant 2 uses the regular octahedron from Lab 1. This application adds a movable camera and real-time Blinn-Phong lighting with directional, point, and spot lights.
 
 ## Requirements
 
@@ -12,11 +9,9 @@ with separate descriptor sets.
 - CMake 3.25 or later
 - Vulkan SDK with `glslc` available under `VULKAN_SDK/Bin`
 
-The first CMake configure downloads GLFW, vk-bootstrap, VMA, and Dear ImGui
-with `FetchContent`; network access is needed unless those sources are already
-cached by CMake.
+The first CMake configure downloads GLFW, vk-bootstrap, VMA, and Dear ImGui with `FetchContent`. Network access is needed unless those sources are already cached.
 
-## Configure and build
+## Build and run
 
 From this repository directory, run PowerShell:
 
@@ -24,31 +19,21 @@ From this repository directory, run PowerShell:
 $env:VULKAN_SDK = 'C:\VulkanSDK\1.4.321.1'
 cmake --preset msvc-debug
 cmake --build build-debug --config Debug --parallel
-```
-
-The preset creates a Visual Studio 2022 build in `build-debug`. Other presets
-use separate directories, so switching generators does not reuse a cache made
-by another generator.
-
-## Run
-
-```powershell
 & '.\build-debug\Debug\vulkan-starter-app.exe'
 ```
 
-CMake compiles the GLSL shaders into the build directory and passes their
-absolute path to the application. The working directory can therefore be
-different from the repository directory.
+CMake compiles the GLSL shaders to SPIR-V in the build directory. The executable can be launched from a different working directory.
 
 ## Controls
 
-- `Projection` selects `Perspective` or `Orthographic`.
-- `Position`, `Rotation (degrees)`, and `Scale` change the first object.
-- `Vertex color tint` multiplies the colors computed for its vertices.
-- `Play animation`, `Path radius`, `Path height`, and `Animation speed` control
-  the first object's motion and rotation.
-- `Show second object` toggles the second octahedron; `Reset scene` restores
-  the initial parameters.
+- **Camera:** use WASD while the application is focused to move, hold RMB to look around, and hold Shift to move faster. Release RMB or press Esc to restore the cursor. Projection and field of view are set in the Camera tab.
+- **Octahedron:** model position, rotation, scale, vertex-color tint, animation, and the second object.
+- **Material:** albedo, specular color, and Blinn-Phong shininess coefficient.
+- **Ambient and directional light:** ambient color and intensity, plus directional-light direction, color, and intensity.
+- **Point lights:** add or remove lights; select a light in the list and enter its X/Y/Z coordinates, color, and intensity.
+- **Spot lights:** add or remove lights; select a light in the list and enter its position and direction, or use Aim at object. Color, intensity, and inner/outer cone angles are editable.
+- **Visualization:** show or hide unlit light markers and spot-cone outlines.
 
-The validation layer output is written to `build-debug/validation.log` when
-validation is enabled by the application.
+Point and spot lights use inverse-square attenuation. Spotlights have a smooth transition between their inner and outer cone angles. Light arrays use runtime-sized storage buffers; the application respects the storage-buffer limit reported by the graphics device.
+
+The validation layer log is written to `build-debug/validation.log` when validation is enabled.

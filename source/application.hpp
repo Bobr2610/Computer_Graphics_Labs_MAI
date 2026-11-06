@@ -4,10 +4,10 @@
 
 namespace application {
 
-bool initialize();
+bool initialize(GLFWwindow *window);
 void shutdown();
 
 void update(double time);
-bool render(const graphics::internal::FrameData& fd);
+bool render(const graphics::internal::FrameData &fd);
 
 } // namespace application

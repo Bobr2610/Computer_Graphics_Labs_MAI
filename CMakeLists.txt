@@ -95,7 +95,7 @@ file(MAKE_DIRECTORY "${SHADER_OUTPUT_DIR}")
 target_compile_definitions(${PROJECT_NAME} PRIVATE OCTAHEDRON_SHADER_DIR="${SHADER_OUTPUT_DIR}")
 target_compile_definitions(${PROJECT_NAME} PRIVATE LAB_VALIDATION_LOG="${CMAKE_CURRENT_BINARY_DIR}/validation.log")
 
-foreach(SHADER_FILE IN ITEMS octahedron.vert octahedron.frag)
+foreach(SHADER_FILE IN ITEMS octahedron.vert octahedron.frag marker.vert marker.frag)
 	set(SHADER_SOURCE ${CMAKE_SOURCE_DIR}/shaders/${SHADER_FILE})
 	set(SHADER_BINARY ${SHADER_FILE}.spv)
 	set(SHADER_BINARY_PATH ${SHADER_OUTPUT_DIR}/${SHADER_BINARY})
