@@ -3,6 +3,7 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <limits>
 
 namespace graphics {
 
@@ -54,6 +55,98 @@ bool uploadBuffer(const GpuBuffer& buffer, const void* data, size_t size) {
 		return false;
 	}
 	return true;
+}
+
+bool immediateSubmit(const std::function<void(VkCommandBuffer)>& record) {
+	auto& context = internal::context;
+	VkCommandPool pool = VK_NULL_HANDLE;
+	VkCommandPoolCreateInfo poolInfo{};
+	poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+	poolInfo.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+	poolInfo.queueFamilyIndex = context.graphics_queue_index;
+	if (vkCreateCommandPool(context.device, &poolInfo, nullptr, &pool) != VK_SUCCESS)
+		return false;
+	VkCommandBuffer command = VK_NULL_HANDLE;
+	VkCommandBufferAllocateInfo allocateInfo{};
+	allocateInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+	allocateInfo.commandPool = pool;
+	allocateInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+	allocateInfo.commandBufferCount = 1;
+	VkResult result = vkAllocateCommandBuffers(context.device, &allocateInfo, &command);
+	if (result == VK_SUCCESS) {
+		VkCommandBufferBeginInfo beginInfo{};
+		beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+		beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+		result = vkBeginCommandBuffer(command, &beginInfo);
+		if (result == VK_SUCCESS) {
+			record(command);
+			result = vkEndCommandBuffer(command);
+		}
+	}
+	if (result == VK_SUCCESS) {
+		VkSubmitInfo submit{};
+		submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+		submit.commandBufferCount = 1;
+		submit.pCommandBuffers = &command;
+		result = vkQueueSubmit(context.graphics_queue, 1, &submit, VK_NULL_HANDLE);
+		if (result == VK_SUCCESS)
+			result = vkQueueWaitIdle(context.graphics_queue);
+	}
+	vkDestroyCommandPool(context.device, pool, nullptr);
+	if (result != VK_SUCCESS)
+		std::cerr << "Failed to submit a one-time GPU transfer\n";
+	return result == VK_SUCCESS;
+}
+
+bool createDeviceLocalBuffer(const void* data, VkDeviceSize size, VkBufferUsageFlags usage,
+							 GpuBuffer& result) {
+	if (data == nullptr || size == 0 || size > std::numeric_limits<size_t>::max())
+		return false;
+	GpuBuffer staging{};
+	if (!createHostBuffer(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, staging))
+		return false;
+	if (!uploadBuffer(staging, data, static_cast<size_t>(size))) {
+		destroyBuffer(staging);
+		return false;
+	}
+	auto& context = internal::context;
+	VkBufferCreateInfo bufferInfo{};
+	bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+	bufferInfo.size = size;
+	bufferInfo.usage = usage | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+	bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+	VmaAllocationCreateInfo allocationInfo{};
+	allocationInfo.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+	if (vmaCreateBuffer(context.allocator, &bufferInfo, &allocationInfo, &result.buffer,
+					&result.allocation, nullptr) != VK_SUCCESS) {
+		destroyBuffer(staging);
+		std::cerr << "Failed to allocate a device-local buffer\n";
+		return false;
+	}
+	result.size = size;
+	const bool copied = immediateSubmit([&](VkCommandBuffer command) {
+		const VkBufferCopy region{0, 0, size};
+		vkCmdCopyBuffer(command, staging.buffer, result.buffer, 1, &region);
+		VkBufferMemoryBarrier barrier{};
+		barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+		barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+		barrier.dstAccessMask = 0;
+		if (usage & VK_BUFFER_USAGE_VERTEX_BUFFER_BIT)
+			barrier.dstAccessMask |= VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT;
+		if (usage & VK_BUFFER_USAGE_INDEX_BUFFER_BIT)
+			barrier.dstAccessMask |= VK_ACCESS_INDEX_READ_BIT;
+		barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		barrier.buffer = result.buffer;
+		barrier.offset = 0;
+		barrier.size = size;
+		vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_VERTEX_INPUT_BIT,
+							 0, 0, nullptr, 1, &barrier, 0, nullptr);
+	});
+	destroyBuffer(staging);
+	if (!copied)
+		destroyBuffer(result);
+	return copied;
 }
 
 std::vector<uint32_t> readShader(const std::string& filename) {

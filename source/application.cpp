@@ -8,7 +8,10 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
+#include <filesystem>
 #include <iostream>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -16,6 +19,9 @@
 #include <GLFW/glfw3.h>
 #include <imgui.h>
 #include <vulkan/vulkan.h>
+
+#define STB_IMAGE_IMPLEMENTATION
+#include <stb_image.h>
 
 namespace application {
 namespace {
@@ -30,6 +36,7 @@ using math::Vec3;
 
 constexpr uint32_t index_count = static_cast<uint32_t>(geometry::octahedronIndices.size());
 constexpr uint32_t object_count = 3;
+constexpr uint32_t texture_material_count = 3;
 constexpr uint32_t main_object_index = 0;
 constexpr uint32_t companion_object_index = 1;
 constexpr uint32_t coneSegments = 32;
@@ -52,7 +59,6 @@ struct alignas(16) SceneUniform {
 struct alignas(16) ObjectUniform {
 	Mat4 model;
 	float albedo[4];
-	float specularColor[4];
 	float material[4];
 };
 
@@ -68,9 +74,30 @@ struct alignas(16) SpotLightGpu {
 	float coneCosines[4];
 };
 
-struct alignas(16) MarkerPush {
-	Mat4 model;
-	float color[4];
+struct alignas(16) EffectPush {
+	float time;
+	float strength;
+	uint32_t flags;
+	float scale;
+};
+
+struct TextureImage {
+	VkImage image = VK_NULL_HANDLE;
+	VmaAllocation allocation = VK_NULL_HANDLE;
+	VkImageView view = VK_NULL_HANDLE;
+	VkSampler sampler = VK_NULL_HANDLE;
+	uint32_t width = 0;
+	uint32_t height = 0;
+};
+
+struct TextureMaterial {
+	const char* name = "";
+	const char* albedoPath = nullptr;
+	const char* specularPath = nullptr;
+	const char* emissivePath = nullptr;
+	TextureImage albedo;
+	TextureImage specular;
+	TextureImage emissive;
 };
 
 struct MarkerVertex {
@@ -78,17 +105,12 @@ struct MarkerVertex {
 };
 
 static_assert(sizeof(SceneUniform) == 208);
-static_assert(sizeof(ObjectUniform) == 112);
+static_assert(sizeof(ObjectUniform) == 96);
 static_assert(sizeof(PointLightGpu) == 32);
 static_assert(sizeof(SpotLightGpu) == 64);
-static_assert(sizeof(MarkerPush) == 80);
+static_assert(sizeof(EffectPush) == 16);
 static_assert(offsetof(SceneUniform, lightCounts) == 192);
-static_assert(offsetof(ObjectUniform, material) == 96);
-
-struct ObjectResources {
-	GpuBuffer uniformBuffer;
-	VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
-};
+static_assert(offsetof(ObjectUniform, material) == 80);
 
 struct PointLight {
 	std::array<float, 3> position{1.8f, 1.2f, 2.0f};
@@ -117,16 +139,16 @@ struct Model {
 	std::array<float, 3> position{};
 	std::array<float, 3> rotation{0.0f, 20.0f, 0.0f};
 	std::array<float, 3> scale{0.9f, 0.9f, 0.9f};
-	std::array<float, 3> tint{1.0f, 1.0f, 1.0f};
 	bool showCompanion = true;
 	bool showFloor = true;
 };
 
 struct Material {
-	std::array<float, 3> albedo{0.45f, 0.55f, 0.65f};
-	std::array<float, 3> specular{0.18f, 0.18f, 0.18f};
+	std::array<float, 3> albedo{1.0f, 1.0f, 1.0f};
 	float shininess = 48.0f;
-	bool vertexColors = false;
+	float specularStrength = 0.7f;
+	float emissiveStrength = 1.5f;
+	bool animateTexture = true;
 };
 
 struct Lighting {
@@ -138,6 +160,7 @@ struct Lighting {
 	std::vector<PointLight> points{PointLight{}};
 	std::vector<SpotLight> spots{SpotLight{}};
 	int mode = 0;
+	bool enabled = true;
 	bool showSources = true;
 };
 
@@ -195,7 +218,19 @@ GpuBuffer markerIndexBuffer;
 GpuBuffer coneVertexBuffer;
 uint32_t markerIndexCount = 0;
 uint32_t coneVertexCount = 0;
-ObjectResources objects[object_count];
+GpuBuffer modelUniformBuffer;
+VkDeviceSize modelUniformStride = 0;
+std::vector<ObjectUniform> modelRecords;
+std::array<TextureMaterial, texture_material_count> textureMaterials{{
+	{"Warm clay", "clay.bmp", "clay_specular.bmp", nullptr},
+	{"Night sky", "night.bmp", "night_specular.bmp", "night_emissive.bmp"},
+	{"Moss stone", "moss.bmp", nullptr, "moss_emissive.bmp"},
+}};
+TextureImage blackFallbackTexture;
+std::array<VkDescriptorSet, 3> materialDescriptorSets{};
+std::array<int, object_count> selectedMaterial{{0, 1, 2}};
+double frameTime = 0.0;
+bool encodeOutputToSrgb = false;
 
 VkDescriptorSetLayout sceneSetLayout = VK_NULL_HANDLE;
 VkDescriptorSetLayout objectSetLayout = VK_NULL_HANDLE;
@@ -285,27 +320,157 @@ std::vector<MarkerVertex> makeConeLines() {
 	return vertices;
 }
 
+void destroyTexture(TextureImage& texture) {
+	auto& context = graphics::internal::context;
+	if (texture.sampler != VK_NULL_HANDLE)
+		vkDestroySampler(context.device, texture.sampler, nullptr);
+	if (texture.view != VK_NULL_HANDLE)
+		vkDestroyImageView(context.device, texture.view, nullptr);
+	if (texture.image != VK_NULL_HANDLE && context.allocator != VK_NULL_HANDLE)
+		vmaDestroyImage(context.allocator, texture.image, texture.allocation);
+	texture = {};
+}
+
+bool createTexture(const unsigned char* pixels, uint32_t width, uint32_t height, bool srgb,
+				   TextureImage& texture, const std::string& label) {
+	if (pixels == nullptr || width == 0 || height == 0 ||
+		static_cast<uint64_t>(width) * height > std::numeric_limits<size_t>::max() / 4)
+		return false;
+	auto& context = graphics::internal::context;
+	const VkDeviceSize byteCount = static_cast<VkDeviceSize>(width) * height * 4;
+	GpuBuffer staging{};
+	if (!createHostBuffer(byteCount, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, staging))
+		return false;
+	if (!uploadBuffer(staging, pixels, static_cast<size_t>(byteCount))) {
+		destroyBuffer(staging);
+		return false;
+	}
+	VkImageCreateInfo imageInfo{};
+	imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+	imageInfo.imageType = VK_IMAGE_TYPE_2D;
+	imageInfo.format = srgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
+	imageInfo.extent = {width, height, 1};
+	imageInfo.mipLevels = 1;
+	imageInfo.arrayLayers = 1;
+	imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+	imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+	imageInfo.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+	imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+	imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+	VmaAllocationCreateInfo allocationInfo{};
+	allocationInfo.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+	if (vmaCreateImage(context.allocator, &imageInfo, &allocationInfo, &texture.image,
+				   &texture.allocation, nullptr) != VK_SUCCESS) {
+		destroyBuffer(staging);
+		std::cerr << "Failed to allocate texture image: " << label << '\n';
+		return false;
+	}
+	texture.width = width;
+	texture.height = height;
+	const bool uploaded = graphics::immediateSubmit([&](VkCommandBuffer command) {
+		VkImageMemoryBarrier barrier{};
+		barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+		barrier.srcAccessMask = 0;
+		barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+		barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+		barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+		barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		barrier.image = texture.image;
+		barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+		vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+							 0, 0, nullptr, 0, nullptr, 1, &barrier);
+		VkBufferImageCopy copy{};
+		copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+		copy.imageExtent = {width, height, 1};
+		vkCmdCopyBufferToImage(command, staging.buffer, texture.image,
+						   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+		barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+		barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+		barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+		barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+		vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT,
+							 VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+							 0, 0, nullptr, 0, nullptr, 1, &barrier);
+	});
+	destroyBuffer(staging);
+	if (!uploaded) {
+		destroyTexture(texture);
+		return false;
+	}
+	VkImageViewCreateInfo viewInfo{};
+	viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+	viewInfo.image = texture.image;
+	viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+	viewInfo.format = imageInfo.format;
+	viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+	if (vkCreateImageView(context.device, &viewInfo, nullptr, &texture.view) != VK_SUCCESS) {
+		destroyTexture(texture);
+		std::cerr << "Failed to create texture view: " << label << '\n';
+		return false;
+	}
+	VkSamplerCreateInfo samplerInfo{};
+	samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+	samplerInfo.magFilter = VK_FILTER_LINEAR;
+	samplerInfo.minFilter = VK_FILTER_LINEAR;
+	samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+	samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+	samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+	samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+	samplerInfo.maxLod = 0.0f;
+	if (vkCreateSampler(context.device, &samplerInfo, nullptr, &texture.sampler) != VK_SUCCESS) {
+		destroyTexture(texture);
+		std::cerr << "Failed to create texture sampler: " << label << '\n';
+		return false;
+	}
+	return true;
+}
+
+bool loadTextureFile(const char* filename, bool srgb, TextureImage& texture) {
+	const std::filesystem::path path = std::filesystem::path(OCTAHEDRON_ASSET_DIR) / filename;
+	int width = 0;
+	int height = 0;
+	int sourceChannels = 0;
+	unsigned char* pixels = stbi_load(path.string().c_str(), &width, &height, &sourceChannels, 4);
+	if (!pixels) {
+		std::cerr << "Could not decode texture " << path.string() << ": " << stbi_failure_reason() << '\n';
+		return false;
+	}
+	const bool created = createTexture(pixels, static_cast<uint32_t>(width),
+									   static_cast<uint32_t>(height), srgb, texture, path.string());
+	stbi_image_free(pixels);
+	return created;
+}
+
+bool createTextures() {
+	const std::array<unsigned char, 4> black{{0, 0, 0, 255}};
+	if (!createTexture(black.data(), 1, 1, false, blackFallbackTexture, "black fallback"))
+		return false;
+	for (TextureMaterial& material : textureMaterials) {
+		if (!loadTextureFile(material.albedoPath, true, material.albedo))
+			return false;
+		if (material.specularPath && !loadTextureFile(material.specularPath, false, material.specular))
+			return false;
+		if (material.emissivePath && !loadTextureFile(material.emissivePath, true, material.emissive))
+			return false;
+	}
+	return true;
+}
+
 bool createMarkerGeometry() {
 	std::vector<uint16_t> sphereIndices;
 	const std::vector<MarkerVertex> sphereVertices = makeSphereVertices(10, 16, sphereIndices);
 	const std::vector<MarkerVertex> coneVertices = makeConeLines();
 	markerIndexCount = static_cast<uint32_t>(sphereIndices.size());
 	coneVertexCount = static_cast<uint32_t>(coneVertices.size());
-	if (!createHostBuffer(sphereVertices.size() * sizeof(MarkerVertex), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
-						  markerVertexBuffer))
+	if (!createDeviceLocalBuffer(sphereVertices.data(), sphereVertices.size() * sizeof(MarkerVertex),
+								  VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, markerVertexBuffer))
 		return false;
-	if (!uploadBuffer(markerVertexBuffer, sphereVertices.data(),
-					  sphereVertices.size() * sizeof(MarkerVertex)))
+	if (!createDeviceLocalBuffer(sphereIndices.data(), sphereIndices.size() * sizeof(uint16_t),
+								  VK_BUFFER_USAGE_INDEX_BUFFER_BIT, markerIndexBuffer))
 		return false;
-	if (!createHostBuffer(sphereIndices.size() * sizeof(uint16_t), VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
-						  markerIndexBuffer))
-		return false;
-	if (!uploadBuffer(markerIndexBuffer, sphereIndices.data(), sphereIndices.size() * sizeof(uint16_t)))
-		return false;
-	if (!createHostBuffer(coneVertices.size() * sizeof(MarkerVertex), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
-						  coneVertexBuffer))
-		return false;
-	return uploadBuffer(coneVertexBuffer, coneVertices.data(), coneVertices.size() * sizeof(MarkerVertex));
+	return createDeviceLocalBuffer(coneVertices.data(), coneVertices.size() * sizeof(MarkerVertex),
+								VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, coneVertexBuffer);
 }
 
 bool ensureStorageCapacity(GpuBuffer &buffer, size_t elementCount, size_t elementSize, uint32_t binding) {
@@ -382,6 +547,36 @@ bool syncLightBuffers() {
 	return uploaded;
 }
 
+bool ensureModelUniformCapacity(size_t recordCount) {
+	const VkDeviceSize required = modelUniformStride * recordCount;
+	if (required <= modelUniformBuffer.size)
+		return true;
+	if (required > std::numeric_limits<uint32_t>::max()) {
+		std::cerr << "The dynamic model buffer exceeds Vulkan's dynamic-offset range\n";
+		return false;
+	}
+	const VkDeviceSize capacity = std::max(required, modelUniformBuffer.size * 2);
+	GpuBuffer replacement{};
+	if (!createHostBuffer(capacity, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, replacement))
+		return false;
+	destroyBuffer(modelUniformBuffer);
+	modelUniformBuffer = replacement;
+	if (materialDescriptorSets[0] != VK_NULL_HANDLE) {
+		for (VkDescriptorSet set : materialDescriptorSets) {
+			VkDescriptorBufferInfo bufferInfo{modelUniformBuffer.buffer, 0, sizeof(ObjectUniform)};
+			VkWriteDescriptorSet write{};
+			write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+			write.dstSet = set;
+			write.dstBinding = 0;
+			write.descriptorCount = 1;
+			write.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+			write.pBufferInfo = &bufferInfo;
+			vkUpdateDescriptorSets(graphics::internal::context.device, 1, &write, 0, nullptr);
+		}
+	}
+	return true;
+}
+
 bool createDescriptorLayouts() {
 	auto &context = graphics::internal::context;
 	std::array<VkDescriptorSetLayoutBinding, 3> sceneBindings{};
@@ -399,41 +594,50 @@ bool createDescriptorLayouts() {
 		return false;
 	}
 
-	const VkDescriptorSetLayoutBinding objectBinding{
-		.binding = 0,
-		.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-		.descriptorCount = 1,
-		.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-	};
+	const std::array<VkDescriptorSetLayoutBinding, 4> objectBindings{{
+		{0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1,
+		 VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+		{1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+		{2, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+		{3, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+	}};
 	VkDescriptorSetLayoutCreateInfo objectLayoutInfo{};
 	objectLayoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-	objectLayoutInfo.bindingCount = 1;
-	objectLayoutInfo.pBindings = &objectBinding;
+	objectLayoutInfo.bindingCount = static_cast<uint32_t>(objectBindings.size());
+	objectLayoutInfo.pBindings = objectBindings.data();
 	if (vkCreateDescriptorSetLayout(context.device, &objectLayoutInfo, nullptr, &objectSetLayout) !=
 		VK_SUCCESS) {
 		std::cerr << "Failed to create the model descriptor-set layout\n";
 		return false;
 	}
 
-	const std::array<VkDescriptorPoolSize, 2> poolSizes{{
-		{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 + object_count},
+	const std::array<VkDescriptorPoolSize, 3> poolSizes{{
+		{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1},
 		{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2},
+		{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, static_cast<uint32_t>(textureMaterials.size())},
+	}};
+	const std::array<VkDescriptorPoolSize, 1> imagePool{{
+		{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+		 static_cast<uint32_t>(textureMaterials.size() * 3)},
 	}};
 	VkDescriptorPoolCreateInfo poolInfo{};
 	poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-	poolInfo.maxSets = 1 + object_count;
-	poolInfo.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
-	poolInfo.pPoolSizes = poolSizes.data();
+	poolInfo.maxSets = 1 + static_cast<uint32_t>(textureMaterials.size());
+	std::array<VkDescriptorPoolSize, 4> allPoolSizes{};
+	std::copy(poolSizes.begin(), poolSizes.end(), allPoolSizes.begin());
+	allPoolSizes[3] = imagePool[0];
+	poolInfo.poolSizeCount = static_cast<uint32_t>(allPoolSizes.size());
+	poolInfo.pPoolSizes = allPoolSizes.data();
 	if (vkCreateDescriptorPool(context.device, &poolInfo, nullptr, &descriptorPool) != VK_SUCCESS) {
 		std::cerr << "Failed to create the application descriptor pool\n";
 		return false;
 	}
 
-	std::array<VkDescriptorSetLayout, 1 + object_count> layouts{};
+	std::array<VkDescriptorSetLayout, 1 + texture_material_count> layouts{};
 	layouts[0] = sceneSetLayout;
-	for (uint32_t i = 0; i < object_count; ++i)
+	for (size_t i = 0; i < textureMaterials.size(); ++i)
 		layouts[1 + i] = objectSetLayout;
-	std::array<VkDescriptorSet, 1 + object_count> descriptorSets{};
+	std::array<VkDescriptorSet, 1 + texture_material_count> descriptorSets{};
 	VkDescriptorSetAllocateInfo allocateInfo{};
 	allocateInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
 	allocateInfo.descriptorPool = descriptorPool;
@@ -444,17 +648,14 @@ bool createDescriptorLayouts() {
 		return false;
 	}
 	sceneDescriptorSet = descriptorSets[0];
-	for (uint32_t i = 0; i < object_count; ++i)
-		objects[i].descriptorSet = descriptorSets[1 + i];
+	for (size_t i = 0; i < textureMaterials.size(); ++i)
+		materialDescriptorSets[i] = descriptorSets[1 + i];
 
-	std::array<VkDescriptorBufferInfo, 3 + object_count> bufferInfos{};
+	std::array<VkDescriptorBufferInfo, 3> bufferInfos{};
 	bufferInfos[0] = {sceneUniformBuffer.buffer, 0, sizeof(SceneUniform)};
 	bufferInfos[1] = {pointLightBuffer.buffer, 0, pointLightBuffer.size};
 	bufferInfos[2] = {spotLightBuffer.buffer, 0, spotLightBuffer.size};
-	for (uint32_t i = 0; i < object_count; ++i) {
-		bufferInfos[3 + i] = {objects[i].uniformBuffer.buffer, 0, sizeof(ObjectUniform)};
-	}
-	std::array<VkWriteDescriptorSet, 3 + object_count> writes{};
+	std::array<VkWriteDescriptorSet, 3> writes{};
 	for (uint32_t i = 0; i < 3; ++i) {
 		writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
 		writes[i].dstSet = sceneDescriptorSet;
@@ -464,16 +665,35 @@ bool createDescriptorLayouts() {
 			i == 0 ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
 		writes[i].pBufferInfo = &bufferInfos[i];
 	}
-	for (uint32_t i = 0; i < object_count; ++i) {
-		VkWriteDescriptorSet &write = writes[3 + i];
-		write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-		write.dstSet = objects[i].descriptorSet;
-		write.dstBinding = 0;
-		write.descriptorCount = 1;
-		write.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-		write.pBufferInfo = &bufferInfos[3 + i];
-	}
 	vkUpdateDescriptorSets(context.device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+	for (size_t i = 0; i < textureMaterials.size(); ++i) {
+		TextureMaterial& material = textureMaterials[i];
+		const TextureImage& specular = material.specular.view ? material.specular : blackFallbackTexture;
+		const TextureImage& emissive = material.emissive.view ? material.emissive : blackFallbackTexture;
+		const std::array<VkDescriptorImageInfo, 3> images{{
+			{material.albedo.sampler, material.albedo.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+			{specular.sampler, specular.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+			{emissive.sampler, emissive.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+		}};
+		std::array<VkWriteDescriptorSet, 4> materialWrites{};
+		materialWrites[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+		materialWrites[0].dstSet = materialDescriptorSets[i];
+		materialWrites[0].dstBinding = 0;
+		materialWrites[0].descriptorCount = 1;
+		materialWrites[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+		VkDescriptorBufferInfo objectInfo{modelUniformBuffer.buffer, 0, sizeof(ObjectUniform)};
+		materialWrites[0].pBufferInfo = &objectInfo;
+		for (uint32_t binding = 1; binding < 4; ++binding) {
+			materialWrites[binding].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+			materialWrites[binding].dstSet = materialDescriptorSets[i];
+			materialWrites[binding].dstBinding = binding;
+			materialWrites[binding].descriptorCount = 1;
+			materialWrites[binding].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+			materialWrites[binding].pImageInfo = &images[binding - 1];
+		}
+		vkUpdateDescriptorSets(context.device, static_cast<uint32_t>(materialWrites.size()),
+							  materialWrites.data(), 0, nullptr);
+	}
 	return true;
 }
 
@@ -503,8 +723,8 @@ bool createPipeline(bool lit, VkPrimitiveTopology topology, VkPipeline &pipeline
 		0, static_cast<uint32_t>(lit ? sizeof(Vertex) : sizeof(MarkerVertex)), VK_VERTEX_INPUT_RATE_VERTEX};
 	const std::array<VkVertexInputAttributeDescription, 3> attributes{{
 		{0, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(Vertex, position)},
-		{1, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(Vertex, color)},
-		{2, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(Vertex, normal)},
+		{1, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(Vertex, normal)},
+		{2, 0, VK_FORMAT_R32G32_SFLOAT, offsetof(Vertex, texCoord)},
 	}};
 	VkPipelineVertexInputStateCreateInfo vertexInput{};
 	vertexInput.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
@@ -574,15 +794,14 @@ bool createPipelines() {
 	info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
 	info.setLayoutCount = static_cast<uint32_t>(layouts.size());
 	info.pSetLayouts = layouts.data();
+	const VkPushConstantRange pushRange{VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(EffectPush)};
+	info.pushConstantRangeCount = 1;
+	info.pPushConstantRanges = &pushRange;
 	if (vkCreatePipelineLayout(device, &info, nullptr, &pipelineLayout) != VK_SUCCESS)
 		return false;
 
-	const VkPushConstantRange pushRange{VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
-										sizeof(MarkerPush)};
-	info.setLayoutCount = 1;
-	info.pSetLayouts = &sceneSetLayout;
-	info.pushConstantRangeCount = 1;
-	info.pPushConstantRanges = &pushRange;
+	info.pushConstantRangeCount = 0;
+	info.pPushConstantRanges = nullptr;
 	if (vkCreatePipelineLayout(device, &info, nullptr, &markerPipelineLayout) != VK_SUCCESS)
 		return false;
 	return createPipeline(true, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, graphicsPipeline) &&
@@ -620,10 +839,14 @@ void releaseResources() {
 	objectSetLayout = VK_NULL_HANDLE;
 	sceneSetLayout = VK_NULL_HANDLE;
 	sceneDescriptorSet = VK_NULL_HANDLE;
-	for (ObjectResources &object : objects) {
-		object.descriptorSet = VK_NULL_HANDLE;
-		destroyBuffer(object.uniformBuffer);
+	materialDescriptorSets.fill(VK_NULL_HANDLE);
+	for (TextureMaterial& material : textureMaterials) {
+		destroyTexture(material.albedo);
+		destroyTexture(material.specular);
+		destroyTexture(material.emissive);
 	}
+	destroyTexture(blackFallbackTexture);
+	destroyBuffer(modelUniformBuffer);
 	destroyBuffer(coneVertexBuffer);
 	destroyBuffer(markerIndexBuffer);
 	destroyBuffer(markerVertexBuffer);
@@ -632,6 +855,8 @@ void releaseResources() {
 	destroyBuffer(indexBuffer);
 	destroyBuffer(vertexBuffer);
 	destroyBuffer(sceneUniformBuffer);
+	modelRecords.clear();
+	modelUniformStride = 0;
 	markerIndexCount = 0;
 	coneVertexCount = 0;
 }
@@ -765,6 +990,15 @@ void drawObjectControls() {
 					  ImGuiSliderFlags_AlwaysClamp);
 	ImGui::Checkbox("Show second octahedron", &scene.model.showCompanion);
 	ImGui::Checkbox("Show floor", &scene.model.showFloor);
+	const char* materialNames[] = {textureMaterials[0].name, textureMaterials[1].name,
+									 textureMaterials[2].name};
+	ImGui::SeparatorText("Surface textures");
+	ImGui::Combo("Main octahedron", &selectedMaterial[main_object_index], materialNames,
+				 static_cast<int>(textureMaterials.size()));
+	ImGui::Combo("Second octahedron", &selectedMaterial[companion_object_index], materialNames,
+				 static_cast<int>(textureMaterials.size()));
+	ImGui::Combo("Floor", &selectedMaterial[2], materialNames,
+				 static_cast<int>(textureMaterials.size()));
 	ImGui::SeparatorText("Animation");
 	ImGui::Checkbox("Play animation", &scene.animation.playing);
 	ImGui::SliderFloat("Speed", &scene.animation.speed, 0.0f, 3.0f);
@@ -775,13 +1009,12 @@ void drawObjectControls() {
 }
 
 void drawMaterialControls() {
-	ImGui::ColorEdit3("Albedo", scene.material.albedo.data());
-	ImGui::ColorEdit3("Specular", scene.material.specular.data());
+	ImGui::ColorEdit3("Texture tint", scene.material.albedo.data());
 	ImGui::SliderFloat("Shininess", &scene.material.shininess, 1.0f, 128.0f, "%.0f");
-	ImGui::Checkbox("Use vertex colors", &scene.material.vertexColors);
-	ImGui::ColorEdit3("Vertex tint", scene.model.tint.data());
-	ImGui::TextWrapped(
-		"Higher shininess makes the highlight narrower. The floor has its own matte material.");
+	ImGui::SliderFloat("Specular strength", &scene.material.specularStrength, 0.0f, 2.0f);
+	ImGui::SliderFloat("Emission strength", &scene.material.emissiveStrength, 0.0f, 4.0f);
+	ImGui::Checkbox("Animated multi-sample on main object", &scene.material.animateTexture);
+	ImGui::TextWrapped("Albedo and emission use sRGB images. Specular masks use linear values.");
 }
 
 void drawSelectedLightControls() {
@@ -827,6 +1060,8 @@ void drawSelectedLightControls() {
 }
 
 void drawLightingControls() {
+	if (ImGui::Button(scene.lighting.enabled ? "Turn lights off" : "Turn lights on"))
+		scene.lighting.enabled = !scene.lighting.enabled;
 	ImGui::Combo("Lighting mode", &scene.lighting.mode,
 				 "Combined\0Directional only\0Point only\0Spot only\0Ambient only\0");
 	if (ImGui::CollapsingHeader("Ambient and directional")) {
@@ -889,11 +1124,11 @@ void drawControls() {
 	const float width = std::clamp(display.x * 0.3f, 300.0f, 380.0f);
 	ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Always);
 	ImGui::SetNextWindowSize(ImVec2(width, display.y), ImGuiCond_Always);
-	ImGui::Begin("Lab 2 controls", nullptr,
+	ImGui::Begin("Lab 3 controls", nullptr,
 				 ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoTitleBar |
 					 ImGuiWindowFlags_NoSavedSettings);
 	sidebarRight = ImGui::GetWindowPos().x + ImGui::GetWindowSize().x;
-	ImGui::SeparatorText("CAMERA AND LIGHTING");
+	ImGui::SeparatorText("TEXTURES, CAMERA AND LIGHTING");
 	const float settingsHeight = std::max(120.0f, ImGui::GetContentRegionAvail().y - 100.0f);
 	ImGui::BeginChild("Settings", ImVec2(0, settingsHeight), false);
 	ImGui::PushItemWidth(std::max(100.0f, width * 0.48f));
@@ -985,103 +1220,142 @@ bool updateUniforms() {
 		sceneData.ambientColorIntensity[i] = scene.lighting.ambientColor[i];
 		sceneData.directionalColorIntensity[i] = scene.lighting.color[i];
 	}
-	sceneData.ambientColorIntensity[3] = scene.lighting.ambientIntensity;
-	sceneData.directionalColorIntensity[3] = scene.lighting.mode <= 1 ? scene.lighting.intensity : 0.0f;
+	sceneData.ambientColorIntensity[3] = scene.lighting.enabled ? scene.lighting.ambientIntensity : 0.0f;
+	sceneData.directionalColorIntensity[3] = scene.lighting.enabled && scene.lighting.mode <= 1
+												 ? scene.lighting.intensity : 0.0f;
 	const Vec3 directionalDirection = math::normalize(fromArray(scene.lighting.direction));
 	sceneData.directionalDirection[0] = directionalDirection.x;
 	sceneData.directionalDirection[1] = directionalDirection.y;
 	sceneData.directionalDirection[2] = directionalDirection.z;
-	sceneData.lightCounts[0] = (scene.lighting.mode == 0 || scene.lighting.mode == 2)
+	sceneData.lightCounts[0] = scene.lighting.enabled && (scene.lighting.mode == 0 || scene.lighting.mode == 2)
 								   ? static_cast<uint32_t>(scene.lighting.points.size())
 								   : 0;
-	sceneData.lightCounts[1] = (scene.lighting.mode == 0 || scene.lighting.mode == 3)
+	sceneData.lightCounts[1] = scene.lighting.enabled && (scene.lighting.mode == 0 || scene.lighting.mode == 3)
 								   ? static_cast<uint32_t>(scene.lighting.spots.size())
 								   : 0;
 	if (!uploadBuffer(sceneUniformBuffer, &sceneData, sizeof(sceneData)))
 		return false;
-
-	ObjectUniform mainUniform{};
-	mainUniform.model = modelMatrixFor(0);
-	for (size_t i = 0; i < 3; ++i) {
-		mainUniform.albedo[i] = scene.material.albedo[i] * scene.model.tint[i];
-		mainUniform.specularColor[i] = scene.material.specular[i];
+	size_t markerCount = 0;
+	if (scene.lighting.showSources) {
+		markerCount = scene.lighting.points.size() + scene.lighting.spots.size();
+		if (interaction.selected.kind == LightKind::spot &&
+			interaction.selected.index < scene.lighting.spots.size())
+			markerCount += 2;
 	}
-	mainUniform.albedo[3] = 1.0f;
-	mainUniform.specularColor[3] = 1.0f;
-	mainUniform.material[0] = scene.material.shininess;
-	mainUniform.material[1] = scene.material.vertexColors ? 1.0f : 0.0f;
-	if (!uploadBuffer(objects[main_object_index].uniformBuffer, &mainUniform, sizeof(mainUniform)))
+	const size_t recordCount = object_count + markerCount;
+	if (!ensureModelUniformCapacity(recordCount))
 		return false;
-
-	ObjectUniform companionUniform{};
-	companionUniform.model = modelMatrixFor(1);
-	companionUniform.albedo[0] = 0.95f * scene.material.albedo[0];
-	companionUniform.albedo[1] = 0.6f * scene.material.albedo[1];
-	companionUniform.albedo[2] = 0.25f * scene.material.albedo[2];
-	companionUniform.albedo[3] = 1.0f;
-	for (size_t i = 0; i < 3; ++i)
-		companionUniform.specularColor[i] = scene.material.specular[i];
-	companionUniform.specularColor[3] = 1.0f;
-	companionUniform.material[0] = scene.material.shininess;
-	companionUniform.material[1] = scene.material.vertexColors ? 1.0f : 0.0f;
-	if (!uploadBuffer(objects[companion_object_index].uniformBuffer, &companionUniform,
-					  sizeof(companionUniform)))
+	modelRecords.assign(recordCount, ObjectUniform{});
+	const auto makeSurfaceRecord = [&](size_t index, const Mat4& model, float red, float green, float blue,
+									   float specular, float emission) {
+		ObjectUniform& record = modelRecords[index];
+		record.model = model;
+		record.albedo[0] = scene.material.albedo[0] * red;
+		record.albedo[1] = scene.material.albedo[1] * green;
+		record.albedo[2] = scene.material.albedo[2] * blue;
+		record.albedo[3] = 1.0f;
+		record.material[0] = scene.material.shininess;
+		record.material[1] = specular;
+		record.material[2] = emission;
+	};
+	makeSurfaceRecord(main_object_index, modelMatrixFor(0), 1.0f, 1.0f, 1.0f,
+					  scene.material.specularStrength, scene.material.emissiveStrength);
+	makeSurfaceRecord(companion_object_index, modelMatrixFor(1), 1.0f, 1.0f, 1.0f,
+					  scene.material.specularStrength, scene.material.emissiveStrength);
+	makeSurfaceRecord(2, modelMatrixFor(2), 1.0f, 1.0f, 1.0f,
+					  scene.material.specularStrength * 0.35f, scene.material.emissiveStrength);
+	const auto setMarkerRecord = [&](size_t index, const Mat4& model, const std::array<float, 3>& color) {
+		ObjectUniform& marker = modelRecords[index];
+		marker.model = model;
+		marker.albedo[0] = std::clamp(color[0], 0.0f, 1.0f);
+		marker.albedo[1] = std::clamp(color[1], 0.0f, 1.0f);
+		marker.albedo[2] = std::clamp(color[2], 0.0f, 1.0f);
+		marker.albedo[3] = 1.0f;
+	};
+	size_t record = object_count;
+	if (scene.lighting.showSources) {
+		for (const PointLight& light : scene.lighting.points)
+			setMarkerRecord(record++, math::modelMatrix(fromArray(light.position), {0, 0, 0}, {0.13f, 0.13f, 0.13f}), light.color);
+		for (size_t i = 0; i < scene.lighting.spots.size(); ++i) {
+			const SpotLight& light = scene.lighting.spots[i];
+			const Vec3 position = fromArray(light.position);
+			const Vec3 direction = math::normalize(fromArray(light.direction));
+			setMarkerRecord(record++, math::modelMatrix(position, {0, 0, 0}, {0.15f, 0.15f, 0.15f}), light.color);
+			if (interaction.selected.kind != LightKind::spot || interaction.selected.index != i)
+				continue;
+			const float coneLength = 1.2f;
+			const float outerRadius = coneLength * std::tan(light.outerAngleDegrees * math::pi / 180.0f);
+			setMarkerRecord(record++, directionMatrix(position, direction, outerRadius, coneLength), {0.9f, 0.9f, 0.9f});
+			const float innerRadius = coneLength * std::tan(light.innerAngleDegrees * math::pi / 180.0f);
+			setMarkerRecord(record++, directionMatrix(position, direction, innerRadius, coneLength), light.color);
+		}
+	}
+	for (size_t i = 0; i < modelRecords.size(); ++i) {
+		const VkDeviceSize offset = modelUniformStride * i;
+		std::memcpy(static_cast<std::byte*>(modelUniformBuffer.mapped) + offset, &modelRecords[i],
+					sizeof(ObjectUniform));
+	}
+	const VkDeviceSize writtenBytes = modelUniformStride * modelRecords.size();
+	if (vmaFlushAllocation(context.allocator, modelUniformBuffer.allocation, 0, writtenBytes) != VK_SUCCESS) {
+		std::cerr << "Failed to flush the dynamic model buffer\n";
 		return false;
-	ObjectUniform floor{};
-	floor.model = math::translationMatrix(0.0f, -1.1f, 0.0f);
-	floor.albedo[0] = 0.3f;
-	floor.albedo[1] = 0.33f;
-	floor.albedo[2] = 0.38f;
-	floor.specularColor[0] = floor.specularColor[1] = floor.specularColor[2] = 0.04f;
-	floor.material[0] = 16.0f;
-	return uploadBuffer(objects[2].uniformBuffer, &floor, sizeof(floor));
+	}
+	return true;
 }
 
-void pushMarker(VkCommandBuffer commandBuffer, const Mat4 &model, const std::array<float, 3> &color) {
-	MarkerPush push{};
-	push.model = model;
-	push.color[0] = std::clamp(color[0], 0.0f, 1.0f);
-	push.color[1] = std::clamp(color[1], 0.0f, 1.0f);
-	push.color[2] = std::clamp(color[2], 0.0f, 1.0f);
-	push.color[3] = 1.0f;
-	vkCmdPushConstants(commandBuffer, markerPipelineLayout,
-					   VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), &push);
+uint32_t dynamicOffset(size_t recordIndex) {
+	return static_cast<uint32_t>(modelUniformStride * recordIndex);
+}
+
+bool isSrgbFormat(VkFormat format) {
+	return format == VK_FORMAT_R8G8B8A8_SRGB || format == VK_FORMAT_B8G8R8A8_SRGB ||
+		   format == VK_FORMAT_A8B8G8R8_SRGB_PACK32;
+}
+
+void bindMaterialRecord(VkCommandBuffer commandBuffer, size_t materialIndex, size_t recordIndex) {
+	const std::array<VkDescriptorSet, 2> sets{{sceneDescriptorSet,
+		materialDescriptorSets[std::min(materialIndex, materialDescriptorSets.size() - 1)]}};
+	const uint32_t offset = dynamicOffset(recordIndex);
+	vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout, 0,
+							static_cast<uint32_t>(sets.size()), sets.data(), 1, &offset);
+	const uint32_t flags =
+		static_cast<uint32_t>(scene.material.animateTexture && recordIndex == main_object_index) |
+		(encodeOutputToSrgb ? 0u : 2u);
+	const EffectPush effect{static_cast<float>(frameTime), 0.8f, flags, 3.0f};
+	vkCmdPushConstants(commandBuffer, pipelineLayout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(effect), &effect);
+}
+
+void bindMarkerRecord(VkCommandBuffer commandBuffer, size_t recordIndex) {
+	const std::array<VkDescriptorSet, 2> sets{{sceneDescriptorSet, materialDescriptorSets[0]}};
+	const uint32_t offset = dynamicOffset(recordIndex);
+	vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, markerPipelineLayout, 0,
+							static_cast<uint32_t>(sets.size()), sets.data(), 1, &offset);
 }
 
 void drawLightVisualization(VkCommandBuffer commandBuffer) {
 	if (!scene.lighting.showSources)
 		return;
 	const VkDeviceSize offset = 0;
-	vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, markerPipelineLayout, 0, 1,
-							&sceneDescriptorSet, 0, nullptr);
 	vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, markerPipeline);
 	vkCmdBindVertexBuffers(commandBuffer, 0, 1, &markerVertexBuffer.buffer, &offset);
 	vkCmdBindIndexBuffer(commandBuffer, markerIndexBuffer.buffer, 0, VK_INDEX_TYPE_UINT16);
+	size_t record = object_count;
 	for (const PointLight &light : scene.lighting.points) {
-		pushMarker(commandBuffer,
-				   math::modelMatrix(fromArray(light.position), {0.0f, 0.0f, 0.0f}, {0.13f, 0.13f, 0.13f}),
-				   light.color);
+		(void)light;
+		bindMarkerRecord(commandBuffer, record++);
 		vkCmdDrawIndexed(commandBuffer, markerIndexCount, 1, 0, 0, 0);
 	}
-	for (const SpotLight &light : scene.lighting.spots) {
-		const Vec3 position = fromArray(light.position);
-		const Vec3 direction = math::normalize(fromArray(light.direction));
-		pushMarker(commandBuffer, math::modelMatrix(position, {0.0f, 0.0f, 0.0f}, {0.15f, 0.15f, 0.15f}),
-				   light.color);
+	for (size_t i = 0; i < scene.lighting.spots.size(); ++i) {
+		const bool selected = interaction.selected.kind == LightKind::spot && interaction.selected.index == i;
+		bindMarkerRecord(commandBuffer, record++);
 		vkCmdDrawIndexed(commandBuffer, markerIndexCount, 1, 0, 0, 0);
-		if (interaction.selected.kind != LightKind::spot ||
-			interaction.selected.index >= scene.lighting.spots.size() ||
-			&light != &scene.lighting.spots[interaction.selected.index])
+		if (!selected)
 			continue;
-		const float coneLength = 1.2f;
-		const float coneRadius = coneLength * std::tan(light.outerAngleDegrees * math::pi / 180.0f);
-		const Mat4 coneModel = directionMatrix(position, direction, coneRadius, coneLength);
-		pushMarker(commandBuffer, coneModel, {0.9f, 0.9f, 0.9f});
+		bindMarkerRecord(commandBuffer, record++);
 		vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, conePipeline);
 		vkCmdBindVertexBuffers(commandBuffer, 0, 1, &coneVertexBuffer.buffer, &offset);
 		vkCmdDraw(commandBuffer, coneVertexCount, 1, 0, 0);
-		const float innerRadius = coneLength * std::tan(light.innerAngleDegrees * math::pi / 180.0f);
-		pushMarker(commandBuffer, directionMatrix(position, direction, innerRadius, coneLength), light.color);
+		bindMarkerRecord(commandBuffer, record++);
 		vkCmdDraw(commandBuffer, coneVertexCount, 1, 0, 0);
 		vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, markerPipeline);
 		vkCmdBindVertexBuffers(commandBuffer, 0, 1, &markerVertexBuffer.buffer, &offset);
@@ -1099,21 +1373,22 @@ bool initialize(GLFWwindow *window) {
 		return false;
 	};
 	scene = SceneState{};
+	selectedMaterial = {0, 1, 2};
+	frameTime = 0.0;
+	encodeOutputToSrgb = !isSrgbFormat(graphics::internal::context.swapchain_format);
 	lightsDirty = true;
 	const auto octahedron = geometry::makeOctahedronVertices();
 	std::vector<Vertex> vertices(octahedron.begin(), octahedron.end());
 	for (const Vec3 &p : {Vec3{-5, 0, -5}, Vec3{5, 0, -5}, Vec3{5, 0, 5}, Vec3{-5, 0, 5}}) {
-		vertices.push_back({{p.x, p.y, p.z}, {1, 1, 1}, {0, 1, 0}});
+		vertices.push_back({{p.x, p.y, p.z}, {0, 1, 0}, {p.x * 0.5f + 2.5f, p.z * 0.5f + 2.5f}});
 	}
 	std::vector<uint16_t> indices(geometry::octahedronIndices.begin(), geometry::octahedronIndices.end());
 	indices.insert(indices.end(), {0, 2, 1, 0, 3, 2});
-	if (!createHostBuffer(vertices.size() * sizeof(Vertex), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, vertexBuffer))
+	if (!createDeviceLocalBuffer(vertices.data(), vertices.size() * sizeof(Vertex),
+								  VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, vertexBuffer))
 		return fail();
-	if (!uploadBuffer(vertexBuffer, vertices.data(), vertices.size() * sizeof(Vertex)))
-		return fail();
-	if (!createHostBuffer(indices.size() * sizeof(uint16_t), VK_BUFFER_USAGE_INDEX_BUFFER_BIT, indexBuffer))
-		return fail();
-	if (!uploadBuffer(indexBuffer, indices.data(), indices.size() * sizeof(uint16_t)))
+	if (!createDeviceLocalBuffer(indices.data(), indices.size() * sizeof(uint16_t),
+								  VK_BUFFER_USAGE_INDEX_BUFFER_BIT, indexBuffer))
 		return fail();
 	VkPhysicalDeviceProperties properties{};
 	vkGetPhysicalDeviceProperties(graphics::internal::context.physical_device, &properties);
@@ -1121,15 +1396,18 @@ bool initialize(GLFWwindow *window) {
 	maxSpotLights = properties.limits.maxStorageBufferRange / sizeof(SpotLightGpu);
 	if (!createHostBuffer(sizeof(SceneUniform), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, sceneUniformBuffer))
 		return fail();
-	for (ObjectResources &object : objects) {
-		if (!createHostBuffer(sizeof(ObjectUniform), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
-							  object.uniformBuffer))
-			return fail();
-	}
+	modelUniformStride = math::dynamicUniformStride(sizeof(ObjectUniform),
+											 properties.limits.minUniformBufferOffsetAlignment);
+	if (modelUniformStride == 0 || modelUniformStride > std::numeric_limits<uint32_t>::max() / object_count ||
+		!createHostBuffer(modelUniformStride * object_count, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+						  modelUniformBuffer))
+		return fail();
 	if (!createMarkerGeometry())
 		return fail();
 	if (!ensureStorageCapacity(pointLightBuffer, scene.lighting.points.size(), sizeof(PointLightGpu), 1) ||
 		!ensureStorageCapacity(spotLightBuffer, scene.lighting.spots.size(), sizeof(SpotLightGpu), 2))
+		return fail();
+	if (!createTextures())
 		return fail();
 	if (!createDescriptorLayouts())
 		return fail();
@@ -1145,6 +1423,7 @@ void shutdown() {
 }
 
 void update(double time) {
+	frameTime = time;
 	updateAnimation(time);
 	drawControls();
 	updateCamera(time);
@@ -1198,23 +1477,16 @@ bool render(const graphics::internal::FrameData &fd) {
 	const VkDeviceSize vertexOffset = 0;
 	vkCmdBindVertexBuffers(fd.command_buffer, 0, 1, &vertexBuffer.buffer, &vertexOffset);
 	vkCmdBindIndexBuffer(fd.command_buffer, indexBuffer.buffer, 0, VK_INDEX_TYPE_UINT16);
-	const std::array<VkDescriptorSet, 2> mainSets{
-		{sceneDescriptorSet, objects[main_object_index].descriptorSet}};
-	vkCmdBindDescriptorSets(fd.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout, 0,
-							static_cast<uint32_t>(mainSets.size()), mainSets.data(), 0, nullptr);
+	bindMaterialRecord(fd.command_buffer, static_cast<size_t>(selectedMaterial[main_object_index]),
+						main_object_index);
 	vkCmdDrawIndexed(fd.command_buffer, index_count, 1, 0, 0, 0);
 	if (scene.model.showCompanion) {
-		const std::array<VkDescriptorSet, 2> companionSets{
-			{sceneDescriptorSet, objects[companion_object_index].descriptorSet}};
-		vkCmdBindDescriptorSets(fd.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout, 0,
-								static_cast<uint32_t>(companionSets.size()), companionSets.data(), 0,
-								nullptr);
+		bindMaterialRecord(fd.command_buffer, static_cast<size_t>(selectedMaterial[companion_object_index]),
+							companion_object_index);
 		vkCmdDrawIndexed(fd.command_buffer, index_count, 1, 0, 0, 0);
 	}
 	if (scene.model.showFloor) {
-		const std::array<VkDescriptorSet, 2> floorSets{sceneDescriptorSet, objects[2].descriptorSet};
-		vkCmdBindDescriptorSets(fd.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout, 0, 2,
-								floorSets.data(), 0, nullptr);
+		bindMaterialRecord(fd.command_buffer, static_cast<size_t>(selectedMaterial[2]), 2);
 		vkCmdDrawIndexed(fd.command_buffer, 6, 1, index_count, 24, 0);
 	}
 	drawLightVisualization(fd.command_buffer);

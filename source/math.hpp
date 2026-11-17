@@ -10,6 +10,10 @@ namespace math {
 
 inline constexpr float pi = std::numbers::pi_v<float>;
 
+inline constexpr size_t dynamicUniformStride(size_t recordSize, size_t alignment) {
+	return alignment == 0 ? recordSize : ((recordSize + alignment - 1) / alignment) * alignment;
+}
+
 struct Vec3 {
 	float x;
 	float y;

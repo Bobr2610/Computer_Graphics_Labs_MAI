@@ -12,11 +12,12 @@ layout(set = 0, binding = 0, std140) uniform SceneData {
     uvec4 lightCounts;
 } scene;
 
-layout(push_constant) uniform MarkerData {
+layout(set = 1, binding = 0, std140) uniform ObjectData {
     mat4 model;
-    vec4 color;
-} marker;
+    vec4 albedo;
+    vec4 material;
+} objectData;
 
 void main() {
-    gl_Position = scene.projection * scene.view * marker.model * vec4(inPosition, 1.0);
+    gl_Position = scene.projection * scene.view * objectData.model * vec4(inPosition, 1.0);
 }

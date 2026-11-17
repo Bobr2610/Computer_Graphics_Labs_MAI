@@ -59,13 +59,26 @@ void checkOctahedron() {
 	for (const auto &[edge, uses] : edgeUses) {
 		require(uses == 2, "Octahedron is not a closed surface");
 	}
-	for (const auto &vertex : geometry::makeOctahedronVertices()) {
+	const auto vertices = geometry::makeOctahedronVertices();
+	for (const auto &vertex : vertices) {
 		const math::Vec3 normal{vertex.normal[0], vertex.normal[1], vertex.normal[2]};
 		const math::Vec3 position{vertex.position[0], vertex.position[1], vertex.position[2]};
 		require(close(math::dot(normal, normal), 1.0f), "Non-unit face normal");
 		require(math::dot(normal, position) > 0.0f, "Face normal must point outward");
-		for (float channel : vertex.color)
-			require(channel >= 0.0f && channel <= 1.0f, "Color outside RGB range");
+		require(vertex.texCoord[0] >= 0.0f && vertex.texCoord[0] <= 1.0f &&
+				vertex.texCoord[1] >= 0.0f && vertex.texCoord[1] <= 1.0f,
+				"Generated texture coordinates are outside the wrapped octahedron map");
+	}
+	require(math::dynamicUniformStride(96, 256) == 256 &&
+			math::dynamicUniformStride(96, 16) == 96,
+			"Dynamic uniform records must respect the device alignment");
+	for (size_t face = 0; face < vertices.size(); face += 3) {
+		const auto& a = vertices[face].texCoord;
+		const auto& b = vertices[face + 1].texCoord;
+		const auto& c = vertices[face + 2].texCoord;
+		const float uvArea = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+		require(std::abs(uvArea) > 0.5f,
+				"An octahedron face needs a non-degenerate, independent UV island");
 	}
 }
 

@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -17,8 +18,11 @@ struct GpuBuffer {
 };
 
 bool createHostBuffer(VkDeviceSize size, VkBufferUsageFlags usage, GpuBuffer& result);
+bool createDeviceLocalBuffer(const void* data, VkDeviceSize size, VkBufferUsageFlags usage,
+							 GpuBuffer& result);
 void destroyBuffer(GpuBuffer& buffer);
 bool uploadBuffer(const GpuBuffer& buffer, const void* data, size_t size);
+bool immediateSubmit(const std::function<void(VkCommandBuffer)>& record);
 
 std::vector<uint32_t> readShader(const std::string& filename);
 VkShaderModule createShaderModule(const std::vector<uint32_t>& words);

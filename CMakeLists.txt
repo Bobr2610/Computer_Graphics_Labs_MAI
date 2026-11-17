@@ -79,6 +79,7 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
 )
 
 target_include_directories(${PROJECT_NAME} PRIVATE ${imgui_SOURCE_DIR} ${imgui_SOURCE_DIR}/backends)
+target_include_directories(${PROJECT_NAME} PRIVATE third_party)
 target_sources(${PROJECT_NAME} PRIVATE
 	${imgui_SOURCE_DIR}/backends/imgui_impl_glfw.cpp
 	${imgui_SOURCE_DIR}/backends/imgui_impl_vulkan.cpp
@@ -93,6 +94,7 @@ set(_SHADER_BINARIES)
 set(SHADER_OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/shaders")
 file(MAKE_DIRECTORY "${SHADER_OUTPUT_DIR}")
 target_compile_definitions(${PROJECT_NAME} PRIVATE OCTAHEDRON_SHADER_DIR="${SHADER_OUTPUT_DIR}")
+target_compile_definitions(${PROJECT_NAME} PRIVATE OCTAHEDRON_ASSET_DIR="${CMAKE_SOURCE_DIR}/assets/textures")
 target_compile_definitions(${PROJECT_NAME} PRIVATE LAB_VALIDATION_LOG="${CMAKE_CURRENT_BINARY_DIR}/validation.log")
 
 foreach(SHADER_FILE IN ITEMS octahedron.vert octahedron.frag marker.vert marker.frag)

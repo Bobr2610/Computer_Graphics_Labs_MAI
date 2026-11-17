@@ -8,8 +8,8 @@ namespace geometry {
 
 struct Vertex {
 	float position[3];
-	float color[3];
 	float normal[3];
+	float texCoord[2];
 };
 
 inline constexpr std::array<math::Vec3, 6> octahedronPositions{{
@@ -32,12 +32,14 @@ inline std::array<Vertex, 24> makeOctahedronVertices() {
 		const auto b = octahedronPositions[octahedronFaces[face + 1]];
 		const auto c = octahedronPositions[octahedronFaces[face + 2]];
 		const auto normal = math::normalize(math::cross(math::subtract(b, a), math::subtract(c, a)));
+		// Each face is its own UV island, so no triangle interpolates across a wrapped seam.
+		constexpr std::array<std::array<float, 2>, 3> faceUv{{{0, 0}, {1, 0}, {0.5f, 1}}};
 		for (size_t corner = 0; corner < 3; ++corner) {
 			const auto p = octahedronPositions[octahedronFaces[face + corner]];
 			vertices[face + corner] = {
 				{p.x, p.y, p.z},
-				{0.5f + 0.5f * p.x, 0.5f + 0.5f * p.y, 0.5f + 0.5f * p.z},
 				{normal.x, normal.y, normal.z},
+				{faceUv[corner][0], faceUv[corner][1]},
 			};
 		}
 	}
